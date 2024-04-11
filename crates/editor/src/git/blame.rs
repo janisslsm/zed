@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use collections::HashMap;
 use git::{
@@ -5,7 +7,7 @@ use git::{
     Oid,
 };
 use gpui::{Model, ModelContext, Subscription, Task};
-use language::{markdown, Bias, Buffer, BufferSnapshot, Edit, ParsedMarkdown};
+use language::{markdown, Bias, Buffer, BufferSnapshot, Edit, LanguageRegistry, ParsedMarkdown};
 use project::{Item, Project};
 use smallvec::SmallVec;
 use sum_tree::SumTree;
@@ -44,15 +46,18 @@ impl<'a> sum_tree::Dimension<'a, GitBlameEntrySummary> for u32 {
     }
 }
 
-pub struct CommitMessage {}
+#[derive(Clone, Debug)]
+pub struct CommitMessage {
+    pub message: String,
+    pub parsed_message: ParsedMarkdown,
+}
 
 pub struct GitBlame {
     project: Model<Project>,
     buffer: Model<Buffer>,
     entries: SumTree<GitBlameEntry>,
     permalinks: HashMap<Oid, Url>,
-    messages: HashMap<Oid, String>,
-    parsed_messages: HashMap<Oid, ParsedMarkdown>,
+    messages: HashMap<Oid, CommitMessage>,
     buffer_snapshot: BufferSnapshot,
     buffer_edits: text::Subscription,
     task: Task<Result<()>>,
@@ -107,7 +112,6 @@ impl GitBlame {
             buffer_edits,
             permalinks: HashMap::default(),
             messages: HashMap::default(),
-            parsed_messages: HashMap::default(),
             task: Task::ready(Ok(())),
             generated: false,
             _refresh_subscription: refresh_subscription,
@@ -124,12 +128,8 @@ impl GitBlame {
         self.permalinks.get(&entry.sha).cloned()
     }
 
-    pub fn message_for_entry(&self, entry: &BlameEntry) -> Option<String> {
+    pub fn message_for_entry(&self, entry: &BlameEntry) -> Option<CommitMessage> {
         self.messages.get(&entry.sha).cloned()
-    }
-
-    pub fn parsed_message_for_entry(&self, entry: &BlameEntry) -> Option<ParsedMarkdown> {
-        self.parsed_messages.get(&entry.sha).cloned()
     }
 
     pub fn blame_for_rows<'a>(
@@ -265,7 +265,7 @@ impl GitBlame {
         let language_registry = self.project.read(cx).languages().clone();
 
         self.task = cx.spawn(|this, mut cx| async move {
-            let (entries, permalinks, messages, parsed_messages) = cx
+            let (entries, permalinks, messages) = cx
                 .background_executor()
                 .spawn({
                     let snapshot = snapshot.clone();
@@ -310,30 +310,20 @@ impl GitBlame {
                             );
                         }
 
-                        let mut parsed_messages = HashMap::default();
-                        for (oid, message) in messages.iter() {
-                            let mut parsed = ParsedMarkdown {
-                                text: String::new(),
-                                highlights: Vec::new(),
-                                regions: Vec::new(),
-                                region_ranges: Vec::new(),
-                            };
+                        let mut commit_messages = HashMap::default();
+                        for (oid, message) in messages.into_iter() {
+                            let parsed_message = parse_markdown(&message, &language_registry).await;
 
-                            markdown::parse_markdown_block(
-                                message,
-                                &language_registry,
-                                None,
-                                &mut parsed.text,
-                                &mut parsed.highlights,
-                                &mut parsed.region_ranges,
-                                &mut parsed.regions,
-                            )
-                            .await;
-
-                            parsed_messages.insert(*oid, parsed);
+                            commit_messages.insert(
+                                oid,
+                                CommitMessage {
+                                    message,
+                                    parsed_message,
+                                },
+                            );
                         }
 
-                        anyhow::Ok((entries, permalinks, messages, parsed_messages))
+                        anyhow::Ok((entries, permalinks, commit_messages))
                     }
                 })
                 .await?;
@@ -344,12 +334,28 @@ impl GitBlame {
                 this.entries = entries;
                 this.permalinks = permalinks;
                 this.messages = messages;
-                this.parsed_messages = parsed_messages;
                 this.generated = true;
                 cx.notify();
             })
         });
     }
+}
+
+async fn parse_markdown(text: &str, language_registry: &Arc<LanguageRegistry>) -> ParsedMarkdown {
+    let mut parsed_message = ParsedMarkdown::default();
+
+    markdown::parse_markdown_block(
+        text,
+        language_registry,
+        None,
+        &mut parsed_message.text,
+        &mut parsed_message.highlights,
+        &mut parsed_message.region_ranges,
+        &mut parsed_message.regions,
+    )
+    .await;
+
+    parsed_message
 }
 
 #[cfg(test)]
